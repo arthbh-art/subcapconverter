@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Subtitle to Avid SubCap Converter</title>
+    <!-- The in‑page processing works entirely within your browser.  Select an SRT, tab‑delimited text, or Word document (.docx) containing English subtitles, and the converter will extract the timecodes and English dialogue, adjust overlapping cues by a frame, and build a downloadable Avid SubCap file. -->
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            min-height: 100vh;
+        }
+        header {
+            background-color: #333;
+            color: #fff;
+            width: 100%;
+            padding: 1rem;
+            text-align: center;
+        }
+        main {
+            flex: 1;
+            width: 90%;
+            max-width: 800px;
+            background-color: #fff;
+            margin-top: 2rem;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+        }
+        .file-input {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 1.5rem;
+        }
+        label {
+            margin-bottom: 0.5rem;
+        }
+        input[type="file"] {
+            padding: 0.5rem;
+            font-size: 1rem;
+        }
+        button {
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: #fff;
+            cursor: pointer;
+            margin-top: 1rem;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        pre {
+            white-space: pre-wrap;
+            background-color: #f0f0f0;
+            padding: 1rem;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 0.9rem;
+        }
+        a.download-link {
+            display: none;
+            margin-top: 1rem;
+            text-decoration: none;
+            color: #28a745;
+            font-weight: bold;
+        }
+    </style>
+    <!-- Load third‑party parsers.  All scripts are deferred so they download
+         after the DOM loads.  If any library fails to load (for example
+         because you are offline), the converter will detect the absence and
+         instruct the user to convert their files to a supported plain text
+         format. -->
+    <!-- Mammoth: DOCX → text/HTML.  Version pinned for stability. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.4.12/mammoth.browser.min.js" defer></script>
+    <!-- PapaParse: CSV parser.  Parses comma‑separated and other delimiter
+         files into arrays. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js" defer></script>
+    <!-- SheetJS: XLSX parser.  Reads Excel files into JavaScript objects. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+</head>
+<body>
+    <header>
+        <h1>Subtitle to Avid SubCap Converter</h1>
+    </header>
+    <main>
+        <div class="file-input">
+            <label for="fileInput">Select an SRT, tab‑delimited text, or Word document (.docx) containing English subtitles:</label>
+            <input id="fileInput" type="file" accept=".srt,.txt,.docx">
+        </div>
+        <button id="convertBtn">Convert to SubCap</button>
+        <pre id="preview"></pre>
+        <a id="downloadLink" class="download-link">Download SubCap File</a>
+    </main>
+    <script>
+        (function() {
+            const fileInput = document.getElementById('fileInput');
+            const convertBtn = document.getElementById('convertBtn');
+            const preview = document.getElementById('preview');
+            const downloadLink = document.getElementById('downloadLink');
+
+            // Convert seconds to Avid 24‑frame timecode (HH:MM:SS:FF)
+            function secondsToTimecode(seconds) {
+                const totalFrames = Math.round(seconds * 24); // 24‑frame timecode for 23.976 projects
+                const framesPerHour = 24 * 60 * 60;
+                const hours = Math.floor(totalFrames / framesPerHour);
+                const remainderAfterHours = totalFrames % framesPerHour;
+                const minutes = Math.floor(remainderAfterHours / (24 * 60));
+                const remainderAfterMinutes = remainderAfterHours % (24 * 60);
+                const secs = Math.floor(remainderAfterMinutes / 24);
+                const frames = remainderAfterMinutes % 24;
+                function pad(n) { return n.toString().padStart(2, '0'); }
+                return `${pad(hours)}:${pad(minutes)}:${pad(secs)}:${pad(frames)}`;
+            }
+
+            // Heuristic to strip romanised local language from caption text.
+            // Given a candidate segment containing local-language and English separated by single spaces,
+            // this function attempts to find the first English word and returns the substring from that word onwards.
+            // English words include common pronouns, articles, auxiliaries, and other common words.  The set
+            // below is not exhaustive but covers a broad range of likely translation starters.
+            function extractEnglishSegment(segment) {
+                // A broad set of English stop‑words and common vocabulary.  This list intentionally
+                // includes pronouns, articles, auxiliaries, conjunctions, prepositions, adverbs
+                // and other high‑frequency words.  It is not exhaustive, but the goal is to
+                // capture enough terms that the first true English word in a mixed
+                // local/English cell will be recognised.  Words are kept lowercase for
+                // case‑insensitive matching.
+                const englishWords = new Set([
+                    // pronouns and determiners
+                    'i','you','he','she','they','we','it','me','my','mine','your','yours','his','her','hers','their','theirs','our','ours','its',
+                    'this','that','these','those','who','whom','whose',
+                    'someone','somebody','something','everyone','everybody','everything','anyone','anybody','anything',
+                    // articles
+                    'a','an','the',
+                    // common verbs (present/past/auxiliary)
+                    'am','is','are','was','were','be','been','being',
+                    'do','does','did','done', 'have','has','had',
+                    'will','would','shall','should','can','could','may','might','must',
+                    'go','goes','went','gone','come','came','see','saw','seen','look','looks','looked','say','says','said','tell','tells','told','think','thinks','thought','ask','asks','asked',
+                    'give','gives','gave','given','take','takes','took','taken','get','gets','got','gotten','make','makes','made',
+                    'like','likes','liked','love','loves','loved','hate','hates','hated','feel','feels','felt','know','knows','knew','known',
+                    'work','works','worked','study','studies','studied','learn','learns','learned','teach','teaches','taught',
+                    'live','lives','lived','grow','grows','grew','grown','born','start','starts','started','begin','begins','began','begun',
+                    // conjunctions and connectives
+                    'and','but','or','nor','yet','so','for','because','since','if','unless','although','though','while','whereas','however','therefore','thus','once',
+                    // prepositions
+                    'in','on','at','by','to','from','for','with','without','about','of','off','into','onto','over','under','above','below','behind','between','through','around','across','after','before','during','inside','outside','within','beyond',
+                    // adverbs and qualifiers
+                    'not','no','yes','very','really','just','only','even','also','too','always','never','ever','sometimes','often','already','soon','later','now','then','today','yesterday','tomorrow','here','there','everywhere',
+                    'up','down','out','in','around','together','apart','again','still','yet','instead','perhaps','maybe','rather','quite','almost','far','near',
+                    // interrogatives
+                    'when','where','what','why','how','which',
+                    // quantity and descriptors
+                    'all','any','each','every','some','few','many','most','much','several','both','either','neither',
+                    'big','small','little','large','great','good','better','best','bad','worse','worst','happy','happier','happiest','sad','sadder','saddest','new','old','young','younger','youngest',
+                    // temporal/numeric nouns
+                    'year','years','month','months','week','weeks','day','days','hour','hours','minute','minutes','second','seconds',
+                    // common nouns relevant to nature/animals/places (domain‑specific)
+                    'people','person','man','woman','child','children','friend','friends','family','community','villagers','village','city','town','place','area','mountain','forest','jungle','tree','trees','bird','birds','animal','animals','panda','pandas','red','habre','nest','nature',
+                    'home','house','school','work','job','guide','staff','mentor','teacher','sir','guest',
+                    // colours and modifiers
+                    'red','blue','green','yellow','brown','white','black','orange','pink','purple',
+                    // miscellaneous frequently used words
+                    'because','why','how','what','who','where','when','which','if','than','then','into','onto','through','over','under','before','after','against','among','between','during','without','within','around','across','toward','towards','along',
+                    'feel','felt','seen','looked','heard','told','asked','answered','thought','believe','believed','remember','remembered',
+                    'world','life','lives','time','times','moment','moments','experience','experiences','question','questions','answer','answers'
+                ]);
+                const words = segment.trim().split(/\s+/);
+                for (let i = 0; i < words.length; i++) {
+                    const clean = words[i].replace(/[.,;?!\"'’”()]/g, '').toLowerCase();
+                    // Treat any token containing at least one Latin letter as English. This allows
+                    // the first English word such as "Thank" to be preserved. We no longer
+                    // rely solely on the englishWords set which omitted words like 'thank'.
+                    if (/[A-Za-z]/.test(clean)) {
+                        return words.slice(i).join(' ');
+                    }
+                }
+                return segment.trim();
+            }
+
+            // Parse SRT format into {start, end, text} objects
+            function parseSrt(text) {
+                const cues = [];
+                const blocks = text.split(/\r?\n\r?\n/);
+                blocks.forEach(block => {
+                    const lines = block.trim().split(/\r?\n/);
+                    if (lines.length >= 2) {
+                        // remove numeric index if present
+                        let idx = 0;
+                        if (/^\d+$/.test(lines[0].trim())) {
+                            idx = 1;
+                        }
+                        // parse timecodes
+                        const times = lines[idx].replace(/\s*-->\s*/, ' ').split(' ');
+                        if (times.length >= 2) {
+                            const startStr = times[0].trim();
+                            const endStr = times[1].trim();
+                            const textLines = lines.slice(idx + 1);
+                            const captionText = textLines.join(' ').trim();
+                            if (captionText) {
+                                const startSec = timeStringToSeconds(startStr);
+                                const endSec = timeStringToSeconds(endStr);
+                                cues.push({ start: startSec, end: endSec, text: captionText });
+                            }
+                        }
+                    }
+                });
+                return cues;
+            }
+
+            // Convert time string (HH:MM:SS,mmm or HH:MM:SS.mmm) to seconds
+            function timeStringToSeconds(str) {
+                const parts = str.replace(',', '.').split(':');
+                const hours = parseInt(parts[0], 10);
+                const minutes = parseInt(parts[1], 10);
+                const secParts = parts[2].split('.');
+                const seconds = parseInt(secParts[0], 10);
+                const ms = secParts.length > 1 ? parseInt(secParts[1].padEnd(3, '0'), 10) : 0;
+                return hours * 3600 + minutes * 60 + seconds + ms / 1000;
+            }
+
+            // Parse tab‑delimited or space‑delimited text into {start, end, text} objects.
+            // This function attempts to detect the English translation column by
+            // scanning for a token that contains Latin letters but no Arabic
+            // script. If found, it joins that token and all subsequent tokens
+            // into the caption text. Rows without a clear English column are
+            // skipped.
+            function parseTabDelimited(text) {
+                const lines = text.split(/\r?\n/);
+                const cues = [];
+                lines.forEach(line => {
+                    if (!line.trim()) return;
+                    // Split by tabs first; if fewer than 3 tokens, fall back to splitting by two or more spaces.
+                    let tokens = line.split(/\t+/);
+                    if (tokens.length < 3) {
+                        tokens = line.split(/\s{2,}/);
+                    }
+                    // Remove empty tokens
+                    tokens = tokens.filter(t => t && t.trim());
+                    if (tokens.length < 3) return;
+                    const startStr = tokens[0].trim();
+                    const endStr = tokens[1].trim();
+                    // Skip header rows or rows that don't look like timecodes
+                    if (!/^\d{2}:\d{2}:\d{2}/.test(startStr)) return;
+                    // Determine the English translation column.
+                    // If there are at least four tokens, assume the third token is local language
+                    // and everything from the fourth onward is English. Otherwise, join from the
+                    // third token onward.  This avoids selecting romanised local language as English.
+                    let engCandidate = '';
+                    if (tokens.length >= 4) {
+                        engCandidate = tokens.slice(3).join(' ').trim();
+                    } else {
+                        engCandidate = tokens.slice(2).join(' ').trim();
+                    }
+                    // Use heuristic to strip any romanised local language from the caption.
+                    const eng = extractEnglishSegment(engCandidate);
+                    if (!eng) return;
+                    const startSec = timeStringToSecondsTab(startStr);
+                    const endSec = timeStringToSecondsTab(endStr);
+                    if (!isNaN(startSec) && !isNaN(endSec)) {
+                        cues.push({ start: startSec, end: endSec, text: eng });
+                    }
+                });
+                return cues;
+            }
+
+            // Parse CSV (comma‑separated or similar) into cues.  Uses
+            // PapaParse if available; otherwise attempts a simple split.
+            function parseCsv(text) {
+                const cues = [];
+                if (typeof Papa !== 'undefined' && Papa.parse) {
+                    const results = Papa.parse(text.trim(), { delimiter: '', skipEmptyLines: true });
+                    if (results && Array.isArray(results.data)) {
+                        results.data.forEach(row => {
+                            if (row.length < 3) return;
+                            const startStr = row[0].trim();
+                            const endStr = row[1].trim();
+                            // Choose the English column as the first column containing Latin letters but no Arabic script
+                            let eng = '';
+                            for (let i = 2; i < row.length; i++) {
+                                const candidate = String(row[i]).trim();
+                                if (/[A-Za-z]{2,}/.test(candidate) && !(/[\u0600-\u06FF]/.test(candidate))) {
+                                    eng = extractEnglishSegment(candidate);
+                                    break;
+                                }
+                            }
+                            if (!eng) eng = extractEnglishSegment(String(row[row.length - 1]).trim());
+                            const startSec = timeStringToSecondsTab(startStr);
+                            const endSec = timeStringToSecondsTab(endStr);
+                            if (!isNaN(startSec) && !isNaN(endSec) && eng) {
+                                cues.push({ start: startSec, end: endSec, text: eng });
+                            }
+                        });
+                        return cues;
+                    }
+                }
+                // Fallback: naive split by commas
+                const lines = text.split(/\r?\n/);
+                lines.forEach(line => {
+                    const cols = line.split(',');
+                    if (cols.length >= 3) {
+                        const startStr = cols[0].trim();
+                        const endStr = cols[1].trim();
+                        let eng = '';
+                        for (let i = 2; i < cols.length; i++) {
+                            const candidate = cols[i].trim();
+                            if (/[A-Za-z]{2,}/.test(candidate) && !(/[\u0600-\u06FF]/.test(candidate))) {
+                                eng = extractEnglishSegment(candidate);
+                                break;
+                            }
+                        }
+                        if (!eng) eng = extractEnglishSegment(cols[cols.length - 1].trim());
+                        const startSec = timeStringToSecondsTab(startStr);
+                        const endSec = timeStringToSecondsTab(endStr);
+                        if (!isNaN(startSec) && !isNaN(endSec) && eng) {
+                            cues.push({ start: startSec, end: endSec, text: eng });
+                        }
+                    }
+                });
+                return cues;
+            }
+
+            // Parse VTT (WebVTT) format into cues.  Similar to SRT but with
+            // possible cues separated by blank lines and optional "WEBVTT" header.
+            function parseVtt(text) {
+                const lines = text.split(/\r?\n/);
+                const cues = [];
+                let i = 0;
+                // Skip header lines starting with WEBVTT
+                while (i < lines.length && lines[i].trim().toUpperCase().startsWith('WEBVTT')) {
+                    i++;
+                }
+                while (i < lines.length) {
+                    // skip empty lines
+                    while (i < lines.length && !lines[i].trim()) i++;
+                    if (i >= lines.length) break;
+                    // cue timing line
+                    const timingLine = lines[i].trim();
+                    const timingMatch = timingLine.match(/(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})/);
+                    if (!timingMatch) { i++; continue; }
+                    const startStr = timingMatch[1];
+                    const endStr = timingMatch[2];
+                    i++;
+                    // accumulate text lines until blank line
+                    const textLines = [];
+                    while (i < lines.length && lines[i].trim()) {
+                        textLines.push(lines[i].trim());
+                        i++;
+                    }
+                    const captionText = textLines.join(' ').trim();
+                    if (captionText) {
+                        const startSec = timeStringToSeconds(startStr);
+                        const endSec = timeStringToSeconds(endStr);
+                        cues.push({ start: startSec, end: endSec, text: captionText });
+                    }
+                    i++;
+                }
+                return cues;
+            }
+
+            // Parse XLSX (Excel) files into cues using SheetJS if available.  Only
+            // reads the first worksheet.  Returns an empty array if parsing
+            // fails or SheetJS is unavailable.
+            function parseXlsx(arrayBuffer) {
+                if (typeof XLSX === 'undefined' || !XLSX.read) {
+                    return null;
+                }
+                    try {
+                    const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+                    const firstSheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[firstSheetName];
+                    const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+                    const cues = [];
+                    jsonData.forEach(row => {
+                        if (!row || row.length < 3) return;
+                        const startStr = String(row[0]).trim();
+                        const endStr = String(row[1]).trim();
+                        let eng = '';
+                        for (let i = 2; i < row.length; i++) {
+                            const candidate = String(row[i]).trim();
+                            if (/[A-Za-z]{2,}/.test(candidate) && !(/[\u0600-\u06FF]/.test(candidate))) {
+                                eng = extractEnglishSegment(candidate);
+                                break;
+                            }
+                        }
+                        if (!eng) eng = extractEnglishSegment(String(row[row.length - 1]).trim());
+                        const startSec = timeStringToSecondsTab(startStr);
+                        const endSec = timeStringToSecondsTab(endStr);
+                        if (!isNaN(startSec) && !isNaN(endSec) && eng) {
+                            cues.push({ start: startSec, end: endSec, text: eng });
+                        }
+                    });
+                    return cues;
+                } catch (err) {
+                    console.error(err);
+                    return null;
+                }
+            }
+
+            // Convert time string from tab files (HH:MM:SS:FF or HH:MM:SS) to seconds
+            function timeStringToSecondsTab(str) {
+                const parts = str.split(':');
+                // Handle HH:MM:SS:FF (frames)
+                if (parts.length === 4) {
+                    const hours = parseInt(parts[0], 10);
+                    const minutes = parseInt(parts[1], 10);
+                    const seconds = parseInt(parts[2], 10);
+                    const frames = parseInt(parts[3], 10);
+                    return hours * 3600 + minutes * 60 + seconds + frames / 24;
+                }
+                // Handle HH:MM:SS
+                if (parts.length === 3) {
+                    const hours = parseInt(parts[0], 10);
+                    const minutes = parseInt(parts[1], 10);
+                    const seconds = parseFloat(parts[2]);
+                    return hours * 3600 + minutes * 60 + seconds;
+                }
+                // Handle MM:SS
+                if (parts.length === 2) {
+                    const minutes = parseInt(parts[0], 10);
+                    const seconds = parseFloat(parts[1]);
+                    return minutes * 60 + seconds;
+                }
+                return NaN;
+            }
+
+            // Parse free‑form transcripts with bracketed timestamps like
+            // "Speaker 1 [00:12:34] Hello world".  Each line with a
+            // timestamp in square brackets is treated as a cue.  The
+            // caption begins immediately after the closing bracket.  End
+            // times are set to the next cue's start, or two seconds
+            // after the start for the final cue.  This function is a
+            // fallback for transcripts that are not tab‑ or comma‑delimited.
+            function parseBracketTimes(text) {
+                const lines = text.split(/\r?\n/);
+                const cues = [];
+                const timePattern = /\[(\d{2}:\d{2}:\d{2}(?::\d{2})?)\]/;
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const match = line.match(timePattern);
+                    if (match) {
+                        const timeStr = match[1];
+                        const startSec = timeStringToSecondsTab(timeStr);
+                        if (isNaN(startSec)) continue;
+                        // extract caption text after the closing bracket
+                        const closeIndex = line.indexOf(']');
+                        let caption = '';
+                        if (closeIndex !== -1) {
+                            caption = line.substring(closeIndex + 1).trim();
+                        } else {
+                            caption = line.trim();
+                        }
+                        // If the caption is empty, skip
+                        if (!caption) continue;
+                        cues.push({ start: startSec, end: startSec, text: caption });
+                    }
+                }
+                // Set end times based on the next cue's start, adjusting final cue to
+                // have a minimal duration (2 seconds).  This will be refined later
+                // in adjustOverlaps.
+                for (let i = 0; i < cues.length; i++) {
+                    if (i < cues.length - 1) {
+                        cues[i].end = cues[i + 1].start;
+                    } else {
+                        cues[i].end = cues[i].start + 2; // 2‑second duration for last cue
+                    }
+                }
+                return cues;
+            }
+
+            // Parse transcripts where a line consists solely of a timestamp (e.g. 00:04, 7:50, 01:02:03, 01:02:03:12).
+            // A line that matches a time pattern starts a new cue, and subsequent non‑time lines are treated as the caption
+            // until the next time line. The end time is set to the start of the next cue, with a 2‑second minimum for the final cue.
+            function parseLineStartTimes(text) {
+                const lines = text.split(/\r?\n/);
+                const cues = [];
+                // Regex to match times of the form H:MM:SS, HH:MM:SS, MM:SS or HH:MM:SS:FF
+                const timeRegex = /^\s*(?:\d+:)?\d{1,2}:\d{2}(?::\d{2})?(?::\d{2})?\s*$/;
+                const parseTime = (ts) => timeStringToSecondsTab(ts.trim());
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].trim();
+                    if (timeRegex.test(line)) {
+                        const start = parseTime(line);
+                        if (isNaN(start)) continue;
+                        const captionLines = [];
+                        let j = i + 1;
+                        while (j < lines.length && !timeRegex.test(lines[j].trim())) {
+                            const txt = lines[j].trim();
+                            if (txt) captionLines.push(txt);
+                            j++;
+                        }
+                        const caption = captionLines.join(' ').trim();
+                        cues.push({ start: start, end: 0, text: caption });
+                    }
+                }
+                // Assign end times
+                for (let i = 0; i < cues.length; i++) {
+                    if (i < cues.length - 1) {
+                        cues[i].end = cues[i + 1].start;
+                    } else {
+                        cues[i].end = cues[i].start + 2;
+                    }
+                    if (cues[i].end <= cues[i].start) {
+                        cues[i].end = cues[i].start + (1 / 24);
+                    }
+                }
+                return cues;
+            }
+
+            // Adjust overlaps by bumping start times and ends
+            function adjustOverlaps(cues) {
+                // Sort by start time
+                const sorted = cues.slice().sort((a, b) => a.start - b.start);
+                for (let i = 0; i < sorted.length; i++) {
+                    const cue = sorted[i];
+                    if (i > 0) {
+                        const prev = sorted[i - 1];
+                        if (cue.start <= prev.end) {
+                            cue.start = prev.end + (1 / 24);
+                        }
+                    }
+                    // ensure end > start
+                    if (cue.end <= cue.start) {
+                        cue.end = cue.start + (1 / 24);
+                    }
+                }
+                return sorted;
+            }
+
+            function buildSubcap(cues) {
+                // Include a blank line after the <begin subtitles> tag to align with Avid requirements
+                let output = '<begin subtitles>\n\n';
+                cues.forEach(cue => {
+                    const startTc = secondsToTimecode(cue.start);
+                    const endTc = secondsToTimecode(cue.end);
+                    output += `${startTc} ${endTc}\n`;
+                    output += `${cue.text}\n\n`;
+                });
+                output += '<end subtitles>\n';
+                return output;
+            }
+
+            function process() {
+                const file = fileInput.files[0];
+                if (!file) {
+                    alert('Please select a file to convert.');
+                    return;
+                }
+                const ext = file.name.split('.').pop().toLowerCase();
+                // Subtitle files (SRT, VTT)
+                if (ext === 'srt' || ext === 'vtt') {
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        const text = reader.result;
+                        let cues = [];
+                        if (ext === 'srt') {
+                            cues = parseSrt(text);
+                        } else {
+                            cues = parseVtt(text);
+                        }
+                        if (!cues.length) {
+                            alert('No cues were detected. Please ensure your file contains timecodes and English dialogue.');
+                            return;
+                        }
+                        const adjusted = adjustOverlaps(cues);
+                        const subcap = buildSubcap(adjusted);
+                        preview.textContent = subcap;
+                        const blob = new Blob([subcap], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        downloadLink.href = url;
+                        downloadLink.download = file.name.replace(/\.[^.]+$/, '') + '_SubCap_23.976_AvidFixed.txt';
+                        downloadLink.style.display = 'inline';
+                        downloadLink.textContent = 'Download SubCap File';
+                    };
+                    reader.readAsText(file);
+                }
+                // Tab‑delimited text
+                else if (ext === 'txt') {
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        const text = reader.result;
+                        // Try parsing as tab‑ or space‑delimited first
+                        let cues = parseTabDelimited(text);
+                        // If no cues, attempt to parse line‑start timestamps (e.g. 00:04, 7:50, 01:02:03)
+                        if (!cues || !cues.length) {
+                            cues = parseLineStartTimes(text);
+                        }
+                        // If still empty, attempt bracketed timestamp parsing (e.g. [00:12:34])
+                        if (!cues || !cues.length) {
+                            cues = parseBracketTimes(text);
+                        }
+                        if (!cues || !cues.length) {
+                            alert('No cues were detected. Please ensure your file contains timecodes and English dialogue.');
+                            return;
+                        }
+                        const adjusted = adjustOverlaps(cues);
+                        const subcap = buildSubcap(adjusted);
+                        preview.textContent = subcap;
+                        const blob = new Blob([subcap], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        downloadLink.href = url;
+                        downloadLink.download = file.name.replace(/\.[^.]+$/, '') + '_SubCap_23.976_AvidFixed.txt';
+                        downloadLink.style.display = 'inline';
+                        downloadLink.textContent = 'Download SubCap File';
+                    };
+                    reader.readAsText(file);
+                }
+                // CSV
+                else if (ext === 'csv') {
+                    if (typeof Papa === 'undefined' || !Papa.parse) {
+                        alert('CSV support is unavailable. Please convert your CSV file to a tab‑delimited text file (.txt) and try again.');
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        const text = reader.result;
+                        let cues = parseCsv(text);
+                        if (!cues.length) {
+                            alert('No cues were detected. Please ensure your file contains timecodes and English dialogue.');
+                            return;
+                        }
+                        const adjusted = adjustOverlaps(cues);
+                        const subcap = buildSubcap(adjusted);
+                        preview.textContent = subcap;
+                        const blob = new Blob([subcap], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        downloadLink.href = url;
+                        downloadLink.download = file.name.replace(/\.[^.]+$/, '') + '_SubCap_23.976_AvidFixed.txt';
+                        downloadLink.style.display = 'inline';
+                        downloadLink.textContent = 'Download SubCap File';
+                    };
+                    reader.readAsText(file);
+                }
+                // Excel (XLSX/XLSM/XLS)
+                else if (ext === 'xlsx' || ext === 'xlsm' || ext === 'xls') {
+                    if (typeof XLSX === 'undefined' || !XLSX.read) {
+                        alert('Excel support is unavailable. Please convert your spreadsheet to a tab‑delimited text file (.txt) or CSV and try again.');
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        const arrayBuffer = reader.result;
+                        const cues = parseXlsx(arrayBuffer);
+                        if (!cues || !cues.length) {
+                            alert('No cues were detected. Please ensure your spreadsheet contains start time, end time and English dialogue columns.');
+                            return;
+                        }
+                        const adjusted = adjustOverlaps(cues);
+                        const subcap = buildSubcap(adjusted);
+                        preview.textContent = subcap;
+                        const blob = new Blob([subcap], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        downloadLink.href = url;
+                        downloadLink.download = file.name.replace(/\.[^.]+$/, '') + '_SubCap_23.976_AvidFixed.txt';
+                        downloadLink.style.display = 'inline';
+                        downloadLink.textContent = 'Download SubCap File';
+                    };
+                    reader.readAsArrayBuffer(file);
+                }
+                // Word DOCX
+                else if (ext === 'docx') {
+                    // If Mammoth isn't available, instruct the user to convert the file manually.
+                    if (typeof mammoth === 'undefined' || typeof DOMParser === 'undefined') {
+                        alert('DOCX support is unavailable. Please convert your Word document to a tab‑delimited text file (.txt) or SRT and try again.');
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        const arrayBuffer = reader.result;
+                        // First attempt: convert to HTML and parse the first table into cues.
+                        mammoth.convertToHtml({ arrayBuffer: arrayBuffer }).then(result => {
+                            const html = result.value;
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(html, 'text/html');
+                            let cues = [];
+                            // Find all table rows. Use both <table> and <tr> in case of nested tables.
+                            const rows = doc.querySelectorAll('table tr');
+                            rows.forEach(row => {
+                                const cells = Array.from(row.querySelectorAll('td, th')).map(cell => cell.textContent.trim());
+                                // Skip empty rows or headers that don't contain timecodes.
+                                if (cells.length < 3) return;
+                                // Remove empty leading cells
+                                while (cells.length && !cells[0]) cells.shift();
+                                if (cells.length < 3) return;
+                                const startStr = cells[0].trim();
+                                const endStr = cells[1].trim();
+                                // Skip header row if not a timecode.
+                                if (!/^\d{2}:\d{2}:\d{2}/.test(startStr)) return;
+                                // Determine English translation: if there are at least four cells, assume
+                                // cells[2] is local language and cells[3] onward comprise the English
+                                // translation. Otherwise, join from cells[2] onward. This avoids
+                                // treating romanised local dialogue as English.
+                                let engCandidate = '';
+                                if (cells.length >= 4) {
+                                    engCandidate = cells.slice(3).join(' ').trim();
+                                } else {
+                                    engCandidate = cells.slice(2).join(' ').trim();
+                                }
+                                const eng = extractEnglishSegment(engCandidate);
+                                if (!eng) return;
+                                const startSec = timeStringToSecondsTab(startStr);
+                                const endSec = timeStringToSecondsTab(endStr);
+                                if (!isNaN(startSec) && !isNaN(endSec)) {
+                                    cues.push({ start: startSec, end: endSec, text: eng });
+                                }
+                            });
+                            // If no cues were extracted from tables, fall back to raw text parsing.
+                            if (!cues.length) {
+                                return mammoth.extractRawText({ arrayBuffer: arrayBuffer }).then(res => {
+                                    const raw = res.value;
+                                    // First try tab‑ or space‑delimited parsing
+                                    let fallbackCues = parseTabDelimited(raw);
+                                    // If no cues, attempt to parse line‑start timestamps (e.g. 00:04, 7:50, 01:02:03)
+                                    if (!fallbackCues || !fallbackCues.length) {
+                                        fallbackCues = parseLineStartTimes(raw);
+                                    }
+                                    // If still empty, attempt bracket‑timestamp parsing
+                                    if (!fallbackCues || !fallbackCues.length) {
+                                        fallbackCues = parseBracketTimes(raw);
+                                    }
+                                    return fallbackCues;
+                                });
+                            }
+                            return cues;
+                        }).then(cuesResult => {
+                            // cuesResult may be the cues array from the table parse or from the raw fallback.
+                            const cues = Array.isArray(cuesResult) ? cuesResult : [];
+                            if (!cues.length) {
+                                alert('No cues found in the DOCX. Ensure the document contains a table with start, end and English dialogue columns.');
+                                return;
+                            }
+                            const adjusted = adjustOverlaps(cues);
+                            const subcap = buildSubcap(adjusted);
+                            preview.textContent = subcap;
+                            const blob = new Blob([subcap], { type: 'text/plain;charset=utf-8' });
+                            const url = URL.createObjectURL(blob);
+                            downloadLink.href = url;
+                            downloadLink.download = file.name.replace(/\.[^.]+$/, '') + '_SubCap_23.976_AvidFixed.txt';
+                            downloadLink.style.display = 'inline';
+                            downloadLink.textContent = 'Download SubCap File';
+                        }).catch(err => {
+                            console.error(err);
+                            alert('Failed to extract text from the DOCX.');
+                        });
+                    };
+                    reader.readAsArrayBuffer(file);
+                }
+                // Unsupported
+                else {
+                    alert('Unsupported file type. Please choose a supported subtitle or spreadsheet file.');
+                }
+            }
+
+            convertBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                process();
+            });
+        })();
+    </script>
+</body>
+</html>
